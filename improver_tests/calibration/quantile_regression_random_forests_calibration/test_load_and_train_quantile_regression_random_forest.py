@@ -655,6 +655,50 @@ def test_load_for_qrf(
         np.testing.assert_almost_equal(cube_inputs[0].data, expected_cube.data)
 
 
+def test_memray_training_stages(monkeypatch, tmp_path):
+    """Stage captures are readable and do not change the trained predictions."""
+    memray = pytest.importorskip("memray")
+    from improver.cli.train_quantile_regression_random_forest import process
+
+    forecast_path, _, _ = _create_multi_site_forecast_parquet_file(tmp_path)
+    truth_path, _ = _create_multi_site_truth_parquet_file(tmp_path)
+    kwargs = {
+        "feature_config": {"air_temperature": ["mean", "std", "altitude"]},
+        "parquet_diagnostic_names": ["temperature_at_screen_level"],
+        "cf_names": ["air_temperature"],
+        "forecast_periods": "6",
+        "cycletime": "20170103T0000Z",
+        "training_length": 2,
+        "experiments": ["latestblend"],
+        "unique_site_id_keys": ["wmo_id"],
+        "n_estimators": 2,
+        "max_depth": 2,
+        "random_state": 46,
+    }
+    monkeypatch.delenv("IMPROVER_MEMRAY_DIR", raising=False)
+    baseline, _, _ = process(forecast_path, truth_path, **kwargs)
+    directory = tmp_path / "captures"
+    monkeypatch.setenv("IMPROVER_MEMRAY_DIR", str(directory))
+    profiled, _, _ = process(forecast_path, truth_path, **kwargs)
+
+    features = np.array([[281.0, 0.0, 10.0]], dtype=np.float32)
+    np.testing.assert_array_equal(
+        profiled.predict(features), baseline.predict(features)
+    )
+    assert {path.name for path in directory.iterdir()} == {
+        "loading.bin",
+        "static_features.bin",
+        "training_arrays.bin",
+        "fitting.bin",
+    }
+    for path in directory.iterdir():
+        reader = memray.FileReader(str(path))
+        assert reader.metadata.has_native_traces
+        assert (
+            next(iter(reader.get_high_watermark_allocation_records()), None) is not None
+        )
+
+
 def test_load_for_qrf_ignores_initial_deterministic_file_for_schema_detection(
     tmp_path,
 ):

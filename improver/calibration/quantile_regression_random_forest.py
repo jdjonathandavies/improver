@@ -12,6 +12,7 @@ import pandas as pd
 from improver import BasePlugin, PostProcessingPlugin
 from improver.calibration.dataframe_utilities import quantile_check
 from improver.constants import DAYS_IN_YEAR, HOURS_IN_DAY
+from improver.memprofile import memray_stage
 
 try:
     from quantile_forest import RandomForestQuantileRegressor
@@ -481,43 +482,45 @@ class TrainQuantileRegressionRandomForests(BasePlugin):
             https://doi.org/10.5194/npg-27-329-2020, 2020.
 
         """
-        if self.transformation:
-            forecast_df.loc[:, self.target_name] = apply_transformation(
-                forecast_df[self.target_name],
-                self.transformation,
-                self.pre_transform_addition,
-            )
-            truth_df.loc[:, "ob_value"] = apply_transformation(
-                truth_df["ob_value"],
-                self.transformation,
-                self.pre_transform_addition,
-            )
+        with memray_stage("training_arrays"):
+            if self.transformation:
+                forecast_df.loc[:, self.target_name] = apply_transformation(
+                    forecast_df[self.target_name],
+                    self.transformation,
+                    self.pre_transform_addition,
+                )
+                truth_df.loc[:, "ob_value"] = apply_transformation(
+                    truth_df["ob_value"],
+                    self.transformation,
+                    self.pre_transform_addition,
+                )
 
-        forecast_df, feature_column_names = prep_features_from_config(
-            forecast_df,
-            self.feature_config,
-            transformation=self.transformation,
-            pre_transform_addition=self.pre_transform_addition,
-            unique_site_id_keys=self.unique_site_id_keys,
-        )
-        merge_columns = [*self.unique_site_id_keys, "time"]
-        _drop_nans_from_forecast_df(
-            forecast_df,
-            merge_columns,
-            feature_column_names,
-            self.valid_forecast_proportion,
-        )
-        forecast_df = sanitise_forecast_dataframe(forecast_df, self.feature_config)
+            forecast_df, feature_column_names = prep_features_from_config(
+                forecast_df,
+                self.feature_config,
+                transformation=self.transformation,
+                pre_transform_addition=self.pre_transform_addition,
+                unique_site_id_keys=self.unique_site_id_keys,
+            )
+            merge_columns = [*self.unique_site_id_keys, "time"]
+            _drop_nans_from_forecast_df(
+                forecast_df,
+                merge_columns,
+                feature_column_names,
+                self.valid_forecast_proportion,
+            )
+            forecast_df = sanitise_forecast_dataframe(forecast_df, self.feature_config)
 
-        combined_df = forecast_df.merge(
-            truth_df[merge_columns + ["ob_value"]], on=merge_columns, how="inner"
-        )
-        feature_values = np.array(combined_df[feature_column_names])
-        target_values = combined_df["ob_value"].values
-        del combined_df
+            combined_df = forecast_df.merge(
+                truth_df[merge_columns + ["ob_value"]], on=merge_columns, how="inner"
+            )
+            feature_values = np.array(combined_df[feature_column_names])
+            target_values = combined_df["ob_value"].values
+            del combined_df
 
         # Fit the quantile regression model
-        return self.fit_qrf(feature_values, target_values)
+        with memray_stage("fitting"):
+            return self.fit_qrf(feature_values, target_values)
 
 
 class ApplyQuantileRegressionRandomForests(PostProcessingPlugin):

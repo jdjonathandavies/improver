@@ -27,6 +27,7 @@ from improver.calibration.quantile_regression_random_forest import (
     TrainQuantileRegressionRandomForests,
     quantile_forest_package_available,
 )
+from improver.memprofile import memray_stage
 
 try:
     from quantile_forest import RandomForestQuantileRegressor
@@ -607,10 +608,11 @@ class PrepareAndTrainQRF(PostProcessingPlugin):
             warnings.warn(msg)
             return None, None, None
 
-        forecast_df = self._add_static_features_from_cubes_to_df(
-            forecast_df, cube_inputs
-        )
-        forecast_df, truth_df = self.filter_bad_sites(forecast_df, truth_df)
+        with memray_stage("static_features"):
+            forecast_df = self._add_static_features_from_cubes_to_df(
+                forecast_df, cube_inputs
+            )
+            forecast_df, truth_df = self.filter_bad_sites(forecast_df, truth_df)
 
         result = TrainQuantileRegressionRandomForests(
             target_name=self.target_cf_name,

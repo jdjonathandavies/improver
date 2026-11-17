@@ -4,14 +4,45 @@
 # See LICENSE in the root of the repository for full licensing details.
 """Module containing maximum memory profiling utilities."""
 
+import os
 import sys
 import time
 import tracemalloc
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from queue import Queue
 from resource import RUSAGE_SELF, getrusage
 from threading import Thread
-from typing import Callable, Tuple
+from typing import Callable, Iterator, Tuple
+
+
+@contextmanager
+def memray_stage(stage: str) -> Iterator[None]:
+    """Optionally capture native allocations during a synchronous training stage.
+
+    Set IMPROVER_MEMRAY_DIR to an output directory to enable profiling. Memray
+    is only imported when enabled and must be installed separately. Captures
+    are named <stage>.bin and existing files are not overwritten.
+
+    Trackers must not overlap, including with an enclosing ``memray run``.
+    Allocations made before entering the stage are not included.
+
+    Args:
+        stage:
+            Name of the stage to capture.
+    """
+    output_dir = os.environ.get("IMPROVER_MEMRAY_DIR")
+    if not output_dir:
+        yield
+        return
+
+    import memray
+
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    with memray.Tracker(str(directory / f"{stage}.bin"), native_traces=True):
+        yield
 
 
 def memory_profile_start(outfile_prefix: str) -> Tuple[Thread, Queue]:

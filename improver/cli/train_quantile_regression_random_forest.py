@@ -36,6 +36,16 @@ def process(
     Two sources of input data must be provided: historical forecasts and
     historical truth data (to use in calibration). The model is output as a pickle file.
 
+    For optional per-stage native memory profiling, install memray and set
+    IMPROVER_MEMRAY_DIR to a fresh output directory. This writes loading.bin,
+    static_features.bin, training_arrays.bin and fitting.bin. Run the command
+    normally, without an enclosing ``memray run`` or ``--memprofile``.
+    Existing captures are not overwritten. Each capture records only allocations
+    made during that stage, not buffers retained from earlier stages. Lazy cube
+    data is captured when used, which may be during static-feature preparation.
+    Generate a report with ``python -m memray flamegraph <capture>.bin`` on
+    the capture machine with the original environment available.
+
     Args:
         file_paths (cli.inputpaths):
             A list of input paths (in any order) containing:
@@ -137,17 +147,19 @@ def process(
         LoadForTrainQRF,
         PrepareAndTrainQRF,
     )
+    from improver.memprofile import memray_stage
 
-    forecast_df, truth_df, cube_inputs = LoadForTrainQRF(
-        experiments=experiments,
-        feature_config=feature_config,
-        parquet_diagnostic_names=parquet_diagnostic_names,
-        cf_names=cf_names,
-        forecast_periods=forecast_periods,
-        cycletime=cycletime,
-        training_length=training_length,
-        unique_site_id_keys=unique_site_id_keys,
-    )(file_paths)
+    with memray_stage("loading"):
+        forecast_df, truth_df, cube_inputs = LoadForTrainQRF(
+            experiments=experiments,
+            feature_config=feature_config,
+            parquet_diagnostic_names=parquet_diagnostic_names,
+            cf_names=cf_names,
+            forecast_periods=forecast_periods,
+            cycletime=cycletime,
+            training_length=training_length,
+            unique_site_id_keys=unique_site_id_keys,
+        )(file_paths)
     if forecast_df is None or truth_df is None or cube_inputs is None:
         return None
 

@@ -464,6 +464,7 @@ def amend_expected_forecast_df(
     cf_names,
     representation,
     site_id,
+    feature_config=None,
 ):
     """Amend the expected forecast DataFrame to match the output of the plugin."""
     forecast_df = filter_forecast_periods(forecast_df, forecast_periods)
@@ -504,14 +505,32 @@ def amend_expected_forecast_df(
         forecast_df["realization"] = forecast_df["realization"].astype(np.int64)
 
     forecast_df.rename(columns={"forecast": "air_temperature"}, inplace=True)
-    return forecast_df
+    # The plugin only loads the columns required downstream.
+    site_id_keys = [site_id] if isinstance(site_id, str) else list(site_id)
+    loaded = [
+        *site_id_keys,
+        "time",
+        "forecast_reference_time",
+        "forecast_period",
+        "air_temperature",
+        representation,
+    ]
+    loaded = [c for c in dict.fromkeys(loaded) if c in forecast_df.columns]
+    features = {f for fs in (feature_config or {}).values() for f in fs}
+    extra = [
+        c
+        for c in forecast_df.columns
+        if c not in loaded and (c in cf_names[1:] or c in features)
+    ]
+    return forecast_df[loaded + extra]
 
 
-def amend_expected_truth_df(truth_df, parquet_diagnostic_name):
+def amend_expected_truth_df(truth_df, parquet_diagnostic_name, site_id="wmo_id"):
     """Amend the expected truth DataFrame to match the output of the plugin."""
     truth_df = truth_df[truth_df["diagnostic"] == parquet_diagnostic_name]
     truth_df["time"] = pd.to_datetime(truth_df["time"], unit="ns", utc=True)
-    return truth_df
+    site_id_keys = [site_id] if isinstance(site_id, str) else list(site_id)
+    return truth_df[list(dict.fromkeys([*site_id_keys, "time", "ob_value"]))]
 
 
 @pytest.mark.parametrize("representation", ["percentile", "realization"])
@@ -619,9 +638,10 @@ def test_load_for_qrf(
         cf_names,
         representation,
         site_id,
+        feature_config=feature_config,
     )
     expected_truth_df = amend_expected_truth_df(
-        expected_truth_df, "temperature_at_screen_level"
+        expected_truth_df, "temperature_at_screen_level", site_id
     )
 
     # Create an instance of LoadForTrainQRF with the required parameters
@@ -638,7 +658,6 @@ def test_load_for_qrf(
     forecast_df, truth_df, cube_inputs = plugin(file_paths)
     assert isinstance(forecast_df, pd.DataFrame)
     assert isinstance(truth_df, pd.DataFrame)
-
     pd.testing.assert_frame_equal(
         forecast_df,
         expected_forecast_df,
@@ -751,6 +770,7 @@ def test_load_for_qrf_ignores_initial_deterministic_file_for_schema_detection(
         ["air_temperature", "wind_speed"],
         "percentile",
         ["wmo_id"],
+        feature_config={"air_temperature": ["altitude"]},
     )
     expected_truth_df = amend_expected_truth_df(
         expected_truth_df, "temperature_at_screen_level"
@@ -815,6 +835,7 @@ def test_load_for_qrf_with_mixed_whitespace_padding_in_forecast_inputs(tmp_path)
         ["air_temperature", "wind_speed"],
         "percentile",
         ["wmo_id"],
+        feature_config={"air_temperature": ["altitude"]},
     )
     expected_truth_df = amend_expected_truth_df(
         expected_truth_df, "temperature_at_screen_level"
@@ -901,6 +922,7 @@ def test_load_for_qrf_mismatches(
         ["air_temperature"],
         "percentile",
         "wmo_id",
+        feature_config=feature_config,
     )
 
     truth_path, expected_truth_df = truth_creation(tmp_path)
@@ -1170,10 +1192,11 @@ def test_prepare_and_train_qrf(
         ["air_temperature"],
         representation,
         site_id,
+        feature_config=feature_config,
     )
     _, truth_df = truth_creation(tmp_path)
 
-    truth_df = amend_expected_truth_df(truth_df, "temperature_at_screen_level")
+    truth_df = amend_expected_truth_df(truth_df, "temperature_at_screen_level", site_id)
 
     if include_dynamic:
         forecast_df["wind_speed"] = [10.0, 20.0, 15.0, 12.0, 11.0][: len(forecast_df)]
@@ -1313,10 +1336,11 @@ def test_filter_bad_sites(
         ["air_temperature"],
         representation,
         site_id,
+        feature_config=feature_config,
     )
     _, truth_df = truth_creation(tmp_path)
 
-    truth_df = amend_expected_truth_df(truth_df, "temperature_at_screen_level")
+    truth_df = amend_expected_truth_df(truth_df, "temperature_at_screen_level", site_id)
 
     if include_nans:
         # Insert a NaN will result in this row being dropped.

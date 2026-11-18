@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Optional, Union
 
 import iris
-import numpy as np
 import pandas as pd
 
 from improver import PostProcessingPlugin
@@ -174,6 +173,67 @@ class LoadForTrainQRF(PostProcessingPlugin):
                 df[key] = df[key].str.strip()
         return df
 
+    def _case_identifier_columns(self) -> list[str]:
+        """Columns identifying a single forecast case (one site, cycle and lead
+        time). These are the keys used to merge diagnostics together and the
+        groups over which the percentile or realization values are aggregated
+        (mean, std, min, max) when features are computed.
+
+        Returns:
+            Names of the case identifier columns.
+        """
+        return [
+            *self.unique_site_id_keys,
+            "forecast_reference_time",
+            "forecast_period",
+        ]
+
+    def _forecast_columns_to_load(
+        self, representation: str, schema_names: list[str]
+    ) -> list[str]:
+        """Determine the minimum set of forecast parquet columns to load.
+
+        Args:
+            representation: Name of the column distinguishing members within a
+                case, either "percentile" or "realization".
+            schema_names: Names of the columns available in the forecast schema.
+
+        Returns:
+            Names of the columns to load, without duplicates.
+        """
+        # Needed to merge diagnostics together and to aggregate over the
+        # representation column when computing mean, std, min and max.
+        case_columns = self._case_identifier_columns()
+        # Needed to merge with the truth data and to compute time-based features.
+        truth_join_columns = [*self.unique_site_id_keys, "time"]
+        # The values being aggregated; renamed to the cf_name after loading.
+        value_columns = ["forecast"]
+        # Features such as latitude or altitude are read straight from the
+        # parquet. Others (mean, std, hour_of_day_cos, static, ...) are computed
+        # later, so are not parquet columns.
+        feature_columns = [
+            feature
+            for features in self.feature_config.values()
+            for feature in features
+            if feature in schema_names
+        ]
+
+        # Order is kept stable so that the loaded column order is unchanged.
+        required_columns = (
+            truth_join_columns
+            + [c for c in case_columns if c not in truth_join_columns]
+            + value_columns
+            + [representation]
+            + feature_columns
+        )
+        # Drop duplicates (e.g. latitude as both a site key and a feature),
+        # preserving order.
+        columns = []
+        for column in required_columns:
+            if column not in columns:
+                columns.append(column)
+        return columns
+
     def _read_parquet_files(
         self,
         forecast_table_path: pathlib.Path | str,
@@ -237,6 +297,15 @@ class LoadForTrainQRF(PostProcessingPlugin):
             )
             raise ValueError(msg)
 
+        representation_name = (
+            "percentile" if "percentile" in altered_schema.names else "realization"
+        )
+        forecast_columns = self._forecast_columns_to_load(
+            representation_name, altered_schema.names
+        )
+        # Forecast periods are stored as int64 nanoseconds.
+        forecast_periods_ns = sorted({int(fp * 1e9) for fp in forecast_periods})
+
         forecast_df = None
         for parquet_diagnostic_name, cf_name, experiment in zip(
             self.parquet_diagnostic_names, self.cf_names, self.experiments
@@ -245,6 +314,7 @@ class LoadForTrainQRF(PostProcessingPlugin):
                 [
                     ("diagnostic", "==", parquet_diagnostic_name),
                     ("blend_time", "in", cycletimes),
+                    ("forecast_period", "in", forecast_periods_ns),
                     ("experiment", "==", experiment),
                 ]
             ]
@@ -252,6 +322,7 @@ class LoadForTrainQRF(PostProcessingPlugin):
             additional_df = pd.read_parquet(
                 forecast_table_path,
                 filters=filters,
+                columns=forecast_columns,
                 schema=altered_schema,
                 engine="pyarrow",
             )
@@ -276,12 +347,7 @@ class LoadForTrainQRF(PostProcessingPlugin):
             representation = (
                 "percentile" if "percentile" in additional_df.columns else "realization"
             )
-            merge_on = [
-                *self.unique_site_id_keys,
-                "forecast_reference_time",
-                "forecast_period",
-                representation,
-            ]
+            merge_on = [*self._case_identifier_columns(), representation]
 
             # If e.g. percentile is all NaN as this is a deterministic diagnostic, remove this column.
             if additional_df[representation].isna().all():
@@ -294,28 +360,24 @@ class LoadForTrainQRF(PostProcessingPlugin):
                 merge_on,
             )
 
-        seconds_to_ns = 1e9
-        forecast_df = forecast_df[
-            forecast_df["forecast_period"].isin(
-                np.array(forecast_periods) * seconds_to_ns
-            )
-        ].reset_index(drop=True)
+        forecast_df = forecast_df.reset_index(drop=True)
 
         # Convert df columns from ns to pandas timestamp object.
-        for column in ["time", "forecast_reference_time", "blend_time"]:
+        for column in ["time", "forecast_reference_time"]:
             forecast_df[column] = pd.to_datetime(
                 forecast_df[column], unit="ns", utc=True
             )
             forecast_df[column] = forecast_df[column].astype("datetime64[ns, UTC]")
-        for column in ["forecast_period", "period"]:
-            forecast_df[column] = pd.to_timedelta(forecast_df[column], unit="ns")
-            forecast_df[column] = forecast_df[column].astype("timedelta64[ns]")
+        forecast_df["forecast_period"] = pd.to_timedelta(
+            forecast_df["forecast_period"], unit="ns"
+        ).astype("timedelta64[ns]")
 
         # Load truths from parquet file filtering by diagnostic.
         filters = [[("diagnostic", "==", self.parquet_diagnostic_names[0])]]
         truth_df = pd.read_parquet(
             truth_table_path,
             filters=filters,
+            columns=[*self.unique_site_id_keys, "time", "ob_value"],
             schema=CalibrationSchemas().TRUTH_SCHEMA,
             engine="pyarrow",
         )

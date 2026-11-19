@@ -458,6 +458,9 @@ class TrainQuantileRegressionRandomForests(BasePlugin):
     ) -> RandomForestQuantileRegressor:
         """Train a quantile regression random forests model.
 
+        For explicit control of input lifetimes, call :meth:`build_training_arrays`,
+        release caller-owned DataFrame references, then call :meth:`fit_qrf`.
+
         Args:
             forecast_df:
                 DataFrame containing the forecast information and features.
@@ -481,6 +484,30 @@ class TrainQuantileRegressionRandomForests(BasePlugin):
             Nonlin. Processes Geophys., 27, 329–347,
             https://doi.org/10.5194/npg-27-329-2020, 2020.
 
+        """
+        feature_values, target_values = self.build_training_arrays(
+            forecast_df, truth_df
+        )
+        del forecast_df, truth_df
+        with memray_stage("fitting"):
+            return self.fit_qrf(feature_values, target_values)
+
+    def build_training_arrays(
+        self,
+        forecast_df: pd.DataFrame,
+        truth_df: pd.DataFrame,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Prepare independent feature and target arrays without fitting a model.
+
+        Args:
+            forecast_df: Forecast information and features.
+            truth_df: Observations to match to the forecast sites and validity times.
+
+        Returns:
+            Feature array (samples, features) and target array (samples,), in the
+            same row and feature order used by :meth:`process`. Neither array
+            retains DataFrame backing storage. Callers can release their
+            DataFrame references before calling :meth:`fit_qrf`.
         """
         with memray_stage("training_arrays"):
             if self.transformation:
@@ -515,12 +542,10 @@ class TrainQuantileRegressionRandomForests(BasePlugin):
                 truth_df[merge_columns + ["ob_value"]], on=merge_columns, how="inner"
             )
             feature_values = np.array(combined_df[feature_column_names])
-            target_values = combined_df["ob_value"].values
+            target_values = combined_df["ob_value"].to_numpy(copy=True)
             del combined_df
 
-        # Fit the quantile regression model
-        with memray_stage("fitting"):
-            return self.fit_qrf(feature_values, target_values)
+        return feature_values, target_values
 
 
 class ApplyQuantileRegressionRandomForests(PostProcessingPlugin):

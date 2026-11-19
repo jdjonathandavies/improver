@@ -167,7 +167,7 @@ def process(
         qrf_kwargs = {}
     if max_features is not None:
         qrf_kwargs["max_features"] = max_features
-    result = PrepareAndTrainQRF(
+    trainer = PrepareAndTrainQRF(
         feature_config=feature_config,
         target_cf_name=cf_names[0],
         n_estimators=n_estimators,
@@ -178,8 +178,11 @@ def process(
         pre_transform_addition=pre_transform_addition,
         unique_site_id_keys=unique_site_id_keys,
         **qrf_kwargs,
-    )(forecast_df, truth_df, cube_inputs)
-    if result == (None, None, None):
+    )
+    training_data = trainer.prepare_training_data(forecast_df, truth_df, cube_inputs)
+    # Release all CLI-owned tabular and ancillary inputs before fitting the forest.
+    del forecast_df, truth_df, cube_inputs
+    if training_data is None:
         return None
 
-    return result
+    return trainer.fit_training_data(*training_data)

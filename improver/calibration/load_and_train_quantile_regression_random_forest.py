@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import iris
+import numpy as np
 import pandas as pd
 
 from improver import PostProcessingPlugin
@@ -664,6 +665,10 @@ class PrepareAndTrainQRF(PostProcessingPlugin):
         of input data must be provided: historical forecasts and historical truth data
         (to use in calibration). The model is output as a pickle file.
 
+        This compatibility interface also fits the model. To release caller-owned
+        DataFrames and cubes before fitting, call :meth:`prepare_training_data`,
+        release the input references, then call :meth:`fit_training_data`.
+
         Args:
             forecast_df: DataFrame containing the forecast data.
             truth_df: DataFrame containing the truth data.
@@ -678,8 +683,33 @@ class PrepareAndTrainQRF(PostProcessingPlugin):
             ValueError: If there are no matching times between the forecast and truth
                 data.
         """
-        if not self.quantile_forest_installed:
+        training_data = self.prepare_training_data(forecast_df, truth_df, cube_inputs)
+        del forecast_df, truth_df, cube_inputs
+        if training_data is None:
             return None, None, None
+        return self.fit_training_data(*training_data)
+
+    def prepare_training_data(
+        self,
+        forecast_df: pd.DataFrame,
+        truth_df: pd.DataFrame,
+        cube_inputs: Optional[iris.cube.CubeList] = None,
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        """Add static features, filter sites and prepare arrays without fitting.
+
+        Args:
+            forecast_df: Forecast information and features.
+            truth_df: Observations used for calibration.
+            cube_inputs: Cubes containing additional static features.
+
+        Returns:
+            Independent feature and target arrays, or None if training cannot
+            proceed. Callers should release their DataFrame and cube references
+            before passing the arrays to :meth:`fit_training_data`. This method
+            does not retain the inputs on the plugin.
+        """
+        if not self.quantile_forest_installed:
+            return None
 
         intersecting_times = self._check_matching_times(forecast_df, truth_df)
         if len(intersecting_times) == 0:
@@ -688,7 +718,7 @@ class PrepareAndTrainQRF(PostProcessingPlugin):
                 "Unable to train the Quantile Regression Random Forest model."
             )
             warnings.warn(msg)
-            return None, None, None
+            return None
 
         with memray_stage("static_features"):
             forecast_df = self._add_static_features_from_cubes_to_df(
@@ -696,7 +726,11 @@ class PrepareAndTrainQRF(PostProcessingPlugin):
             )
             forecast_df, truth_df = self.filter_bad_sites(forecast_df, truth_df)
 
-        result = TrainQuantileRegressionRandomForests(
+        return self._training_plugin().build_training_arrays(forecast_df, truth_df)
+
+    def _training_plugin(self) -> TrainQuantileRegressionRandomForests:
+        """Create a trainer with the preparation and fitting configuration."""
+        return TrainQuantileRegressionRandomForests(
             target_name=self.target_cf_name,
             feature_config=self.feature_config,
             n_estimators=self.n_estimators,
@@ -707,8 +741,21 @@ class PrepareAndTrainQRF(PostProcessingPlugin):
             pre_transform_addition=self.pre_transform_addition,
             unique_site_id_keys=self.unique_site_id_keys,
             **self.kwargs,
-        )(forecast_df, truth_df)
+        )
 
-        # Create a tuple that returns the model, transformation and
-        # pre_transform_addition to allow these to be saved together.
+    def fit_training_data(
+        self, feature_values: np.ndarray, target_values: np.ndarray
+    ) -> tuple[RandomForestQuantileRegressor, Optional[str], float]:
+        """Fit prepared arrays and return the existing serialisable model tuple.
+
+        Args:
+            feature_values: Feature array with shape (samples, features).
+            target_values: Target array with shape (samples,).
+
+        Returns:
+            The trained model, transformation and pre-transform addition, as
+            returned by :meth:`process` and consumed by the application code.
+        """
+        with memray_stage("fitting"):
+            result = self._training_plugin().fit_qrf(feature_values, target_values)
         return (result, self.transformation, self.pre_transform_addition)

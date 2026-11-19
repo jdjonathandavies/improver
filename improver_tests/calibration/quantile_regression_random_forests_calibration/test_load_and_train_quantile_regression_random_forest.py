@@ -4,6 +4,9 @@
 # See LICENSE in the root of the repository for full licensing details.
 """Unit tests for the LoadForTrainQRF and PrepareAndTrain QRF plugins."""
 
+import pickle
+import weakref
+
 import iris
 import numpy as np
 import pandas as pd
@@ -716,6 +719,76 @@ def test_memray_training_stages(monkeypatch, tmp_path):
         assert (
             next(iter(reader.get_high_watermark_allocation_records()), None) is not None
         )
+
+
+@pytest.mark.parametrize("transformation", [None, "log"])
+def test_cli_releases_dataframes_before_fitting(monkeypatch, tmp_path, transformation):
+    """CLI fitting retains only arrays, with the existing model tuple unchanged."""
+    from improver.calibration.quantile_regression_random_forest import (
+        TrainQuantileRegressionRandomForests,
+    )
+    from improver.cli.train_quantile_regression_random_forest import process
+
+    forecast_path, _, _ = _create_multi_site_forecast_parquet_file(tmp_path)
+    truth_path, _ = _create_multi_site_truth_parquet_file(tmp_path)
+    loader_kwargs = {
+        "feature_config": {"air_temperature": ["mean", "std", "altitude"]},
+        "parquet_diagnostic_names": ["temperature_at_screen_level"],
+        "cf_names": ["air_temperature"],
+        "forecast_periods": "6",
+        "cycletime": "20170103T0000Z",
+        "training_length": 2,
+        "experiments": ["latestblend"],
+        "unique_site_id_keys": ["wmo_id"],
+    }
+    training_kwargs = {
+        "n_estimators": 2,
+        "max_depth": 2,
+        "random_state": 46,
+        "transformation": transformation,
+        "pre_transform_addition": 1.0,
+    }
+    monkeypatch.delenv("IMPROVER_MEMRAY_DIR", raising=False)
+    inputs = LoadForTrainQRF(**loader_kwargs)([forecast_path, truth_path])
+    expected = PrepareAndTrainQRF(
+        feature_config=loader_kwargs["feature_config"],
+        target_cf_name="air_temperature",
+        **training_kwargs,
+    )(*inputs)
+    del inputs
+
+    references = []
+    load = LoadForTrainQRF.process
+    prepare = TrainQuantileRegressionRandomForests.build_training_arrays
+    fit = TrainQuantileRegressionRandomForests.fit_qrf
+
+    def track_loaded_inputs(self, file_paths):
+        result = load(self, file_paths)
+        references.extend(weakref.ref(value) for value in result)
+        return result
+
+    def track_prepared_inputs(self, forecast_df, truth_df):
+        references.extend([weakref.ref(forecast_df), weakref.ref(truth_df)])
+        return prepare(self, forecast_df, truth_df)
+
+    def check_released_inputs(self, features, targets):
+        assert references
+        assert all(reference() is None for reference in references)
+        assert features.flags.owndata
+        assert targets.flags.owndata
+        return fit(self, features, targets)
+
+    monkeypatch.setattr(LoadForTrainQRF, "process", track_loaded_inputs)
+    monkeypatch.setattr(
+        TrainQuantileRegressionRandomForests,
+        "build_training_arrays",
+        track_prepared_inputs,
+    )
+    monkeypatch.setattr(
+        TrainQuantileRegressionRandomForests, "fit_qrf", check_released_inputs
+    )
+    actual = process(forecast_path, truth_path, **loader_kwargs, **training_kwargs)
+    assert pickle.dumps(actual) == pickle.dumps(expected)
 
 
 def test_load_for_qrf_ignores_initial_deterministic_file_for_schema_detection(

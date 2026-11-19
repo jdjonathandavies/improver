@@ -155,23 +155,66 @@ class LoadForTrainQRF(PostProcessingPlugin):
         forecast_periods = sorted(set(all_periods))
         return [fp * 3600 for fp in forecast_periods]
 
-    def _strip_unique_site_id_whitespace(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Strip whitespace from string-valued unique site ID columns. This is
-        to ensure that additional whitespace doesn't prevent sites from matching
-        between different forecast inputs and between the forecast and truth data
-        (e.g. "03003" vs "03003   ").
+    def _read_and_normalise_parquet(
+        self,
+        table_path: pathlib.Path | str,
+        filters: list,
+        columns: list[str],
+        schema,
+    ) -> pd.DataFrame:
+        """Read parquet data, normalise site IDs and time dtypes, and return a
+        pandas DataFrame. Normalisation is performed in pyarrow before conversion
+        to pandas. Doing this in pyarrow avoids
+        creating a Python string object per row and avoids pandas copying every
+        column again afterwards.
+
+        The following are applied:
+            - Whitespace is stripped from string-valued unique site ID columns,
+              so that additional whitespace doesn't prevent sites matching
+              between different forecast inputs and between the forecast and
+              truth data (e.g. "03003" vs "03003   ").
+            - "time" and "forecast_reference_time" are converted to
+              datetime64[ns, UTC].
+            - "forecast_period", stored as int64 nanoseconds, is converted to
+              timedelta64[ns].
 
         Args:
-            df: DataFrame containing the forecast or truth data.
+            table_path: Path to the parquet dataset.
+            filters: Row filters passed to the parquet reader.
+            columns: Names of the columns to load.
+            schema: pyarrow schema used to read the dataset.
 
         Returns:
-            DataFrame with whitespace stripped from string-valued unique site ID
-            columns.
+            DataFrame containing the requested rows and columns, with stripped
+            string site IDs and nanosecond-resolution time and duration columns.
         """
-        for key in self.unique_site_id_keys:
-            if key in df.columns and pd.api.types.is_string_dtype(df[key]):
-                df[key] = df[key].str.strip()
-        return df
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        # Read only requested columns and matching rows using the supplied schema.
+        table = pq.read_table(
+            table_path, columns=columns, filters=filters, schema=schema
+        )
+        for name in table.column_names:
+            field = table.schema.field(name)
+            if name in self.unique_site_id_keys and (
+                pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
+            ):
+                # Strip site-ID whitespace without changing the string type.
+                column = pc.utf8_trim_whitespace(table[name])
+            elif name in ["time", "forecast_reference_time"]:
+                # Cast timestamps to nanosecond resolution with the UTC timezone.
+                column = table[name].cast(pa.timestamp("ns", "UTC"))
+            elif name == "forecast_period":
+                # Interpret integer nanoseconds as a nanosecond-resolution duration.
+                column = table[name].cast(pa.duration("ns"))
+            else:
+                # Leave columns that do not need normalisation unchanged.
+                continue
+            # Replace the column at its existing position with the normalised values.
+            table = table.set_column(table.schema.get_field_index(name), name, column)
+        return table.to_pandas()
 
     def _case_identifier_columns(self) -> list[str]:
         """Columns identifying a single forecast case (one site, cycle and lead
@@ -319,12 +362,8 @@ class LoadForTrainQRF(PostProcessingPlugin):
                 ]
             ]
 
-            additional_df = pd.read_parquet(
-                forecast_table_path,
-                filters=filters,
-                columns=forecast_columns,
-                schema=altered_schema,
-                engine="pyarrow",
+            additional_df = self._read_and_normalise_parquet(
+                forecast_table_path, filters, forecast_columns, altered_schema
             )
 
             if additional_df.empty:
@@ -335,9 +374,6 @@ class LoadForTrainQRF(PostProcessingPlugin):
                     f"forecast parquet file: {parquet_diagnostic_name}."
                 )
                 raise ValueError(msg)
-
-            # Single shared strip call for every forecast dataframe loaded.
-            additional_df = self._strip_unique_site_id_whitespace(additional_df)
 
             if forecast_df is None:
                 additional_df.rename(columns={"forecast": cf_name}, inplace=True)
@@ -362,30 +398,14 @@ class LoadForTrainQRF(PostProcessingPlugin):
 
         forecast_df = forecast_df.reset_index(drop=True)
 
-        # Convert df columns from ns to pandas timestamp object.
-        for column in ["time", "forecast_reference_time"]:
-            forecast_df[column] = pd.to_datetime(
-                forecast_df[column], unit="ns", utc=True
-            )
-            forecast_df[column] = forecast_df[column].astype("datetime64[ns, UTC]")
-        forecast_df["forecast_period"] = pd.to_timedelta(
-            forecast_df["forecast_period"], unit="ns"
-        ).astype("timedelta64[ns]")
-
         # Load truths from parquet file filtering by diagnostic.
         filters = [[("diagnostic", "==", self.parquet_diagnostic_names[0])]]
-        truth_df = pd.read_parquet(
+        truth_df = self._read_and_normalise_parquet(
             truth_table_path,
-            filters=filters,
-            columns=[*self.unique_site_id_keys, "time", "ob_value"],
-            schema=CalibrationSchemas().TRUTH_SCHEMA,
-            engine="pyarrow",
+            filters,
+            [*self.unique_site_id_keys, "time", "ob_value"],
+            CalibrationSchemas().TRUTH_SCHEMA,
         )
-
-        truth_df["time"] = pd.to_datetime(truth_df["time"], unit="ns", utc=True)
-        truth_df["time"] = truth_df["time"].astype("datetime64[ns, UTC]")
-
-        truth_df = self._strip_unique_site_id_whitespace(truth_df)
 
         if truth_df.empty:
             msg = (

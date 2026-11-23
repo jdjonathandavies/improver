@@ -217,25 +217,51 @@ class LoadForTrainQRF(PostProcessingPlugin):
             table = table.set_column(table.schema.get_field_index(name), name, column)
         return table.to_pandas()
 
-    def _case_identifier_columns(self) -> list[str]:
-        """Columns identifying a single forecast case (one site, cycle and lead
-        time). These are the keys used to merge diagnostics together and the
-        groups over which the percentile or realization values are aggregated
-        (mean, std, min, max) when features are computed.
+    def _diagnostic_merge_columns(
+        self, representation: Optional[str] = None
+    ) -> list[str]:
+        """Return the columns used to merge diagnostics.
+
+        Site, cycle and lead-time columns identify a forecast case. The
+        representation column, when supplied, distinguishes percentile or
+        realization rows within each case. The case columns are also the
+        grouping keys used when ensemble features are aggregated.
 
         Returns:
-            Names of the case identifier columns.
+            Merge columns for joining one diagnostic to another.
         """
-        return [
+        columns = [
             *self.unique_site_id_keys,
             "forecast_reference_time",
             "forecast_period",
+        ]
+        if representation is not None:
+            columns.append(representation)
+        return columns
+
+    @staticmethod
+    def _ordered_unique_columns(*column_groups: list[str]) -> list[str]:
+        """Combine column groups in order, retaining only their first occurrence."""
+        columns = []
+        for group in column_groups:
+            for column in group:
+                if column not in columns:
+                    columns.append(column)
+        return columns
+
+    def _forecast_feature_columns_to_load(self, schema_names: list[str]) -> list[str]:
+        """Select configured features that are stored directly in forecast parquet."""
+        return [
+            feature
+            for features in self.feature_config.values()
+            for feature in features
+            if feature in schema_names
         ]
 
     def _forecast_columns_to_load(
         self, representation: str, schema_names: list[str]
     ) -> list[str]:
-        """Determine the minimum set of forecast parquet columns to load.
+        """Select columns for the first forecast diagnostic parquet read.
 
         Args:
             representation: Name of the column distinguishing members within a
@@ -243,40 +269,43 @@ class LoadForTrainQRF(PostProcessingPlugin):
             schema_names: Names of the columns available in the forecast schema.
 
         Returns:
-            Names of the columns to load, without duplicates.
+            Site and validity-time keys, diagnostic merge keys, values and
+            configured feature columns, without duplicates.
         """
-        # Needed to merge diagnostics together and to aggregate over the
-        # representation column when computing mean, std, min and max.
-        case_columns = self._case_identifier_columns()
-        # Needed to merge with the truth data and to compute time-based features.
-        truth_join_columns = [*self.unique_site_id_keys, "time"]
-        # The values being aggregated; renamed to the cf_name after loading.
-        value_columns = ["forecast"]
-        # Features such as latitude or altitude are read straight from the
-        # parquet. Others (mean, std, hour_of_day_cos, static, ...) are computed
-        # later, so are not parquet columns.
-        feature_columns = [
-            feature
-            for features in self.feature_config.values()
-            for feature in features
-            if feature in schema_names
-        ]
+        # Validity time supports truth matching and time-based features.
+        validity_columns = [*self.unique_site_id_keys, "time"]
+        # Case keys support diagnostic merges and aggregate member features.
+        diagnostic_case_columns = self._diagnostic_merge_columns()
+        # Each parquet forecast value is renamed to its configured cf_name.
+        forecast_value_columns = ["forecast"]
+        # Keep the representation after the value column, matching the existing
+        # forecast DataFrame column order.
+        representation_columns = [representation]
+        # Coordinates such as altitude are read; computed features are not columns.
+        forecast_feature_columns = self._forecast_feature_columns_to_load(schema_names)
 
-        # Order is kept stable so that the loaded column order is unchanged.
-        required_columns = (
-            truth_join_columns
-            + [c for c in case_columns if c not in truth_join_columns]
-            + value_columns
-            + [representation]
-            + feature_columns
+        return self._ordered_unique_columns(
+            validity_columns,
+            diagnostic_case_columns,
+            forecast_value_columns,
+            representation_columns,
+            forecast_feature_columns,
         )
-        # Drop duplicates (e.g. latitude as both a site key and a feature),
-        # preserving order.
-        columns = []
-        for column in required_columns:
-            if column not in columns:
-                columns.append(column)
-        return columns
+
+    def _predictor_columns_to_load(self, representation: str) -> list[str]:
+        """Select only merge keys and values for subsequent diagnostic reads."""
+        return self._ordered_unique_columns(
+            self._diagnostic_merge_columns(representation),
+            ["forecast"],
+        )
+
+    def _truth_columns_to_load(self) -> list[str]:
+        """Select site/time join keys and the observation value from parquet."""
+        return self._ordered_unique_columns(
+            self.unique_site_id_keys,
+            ["time"],
+            ["ob_value"],
+        )
 
     def _read_parquet_files(
         self,
@@ -344,9 +373,13 @@ class LoadForTrainQRF(PostProcessingPlugin):
         representation_name = (
             "percentile" if "percentile" in altered_schema.names else "realization"
         )
-        forecast_columns = self._forecast_columns_to_load(
+        # The first diagnostic supplies shared features and validity time;
+        # later diagnostics supply values matched on diagnostic merge columns.
+        diagnostic_merge_columns = self._diagnostic_merge_columns(representation_name)
+        initial_forecast_columns = self._forecast_columns_to_load(
             representation_name, altered_schema.names
         )
+        predictor_columns = self._predictor_columns_to_load(representation_name)
         # Forecast periods are stored as int64 nanoseconds.
         forecast_periods_ns = sorted({int(fp * 1e9) for fp in forecast_periods})
 
@@ -364,7 +397,14 @@ class LoadForTrainQRF(PostProcessingPlugin):
             ]
 
             additional_df = self._read_and_normalise_parquet(
-                forecast_table_path, filters, forecast_columns, altered_schema
+                forecast_table_path,
+                filters,
+                (
+                    initial_forecast_columns
+                    if forecast_df is None
+                    else predictor_columns
+                ),
+                altered_schema,
             )
 
             if additional_df.empty:
@@ -384,7 +424,7 @@ class LoadForTrainQRF(PostProcessingPlugin):
             representation = (
                 "percentile" if "percentile" in additional_df.columns else "realization"
             )
-            merge_on = [*self._case_identifier_columns(), representation]
+            merge_on = diagnostic_merge_columns.copy()
 
             # If e.g. percentile is all NaN as this is a deterministic diagnostic, remove this column.
             if additional_df[representation].isna().all():
@@ -404,7 +444,7 @@ class LoadForTrainQRF(PostProcessingPlugin):
         truth_df = self._read_and_normalise_parquet(
             truth_table_path,
             filters,
-            [*self.unique_site_id_keys, "time", "ob_value"],
+            self._truth_columns_to_load(),
             CalibrationSchemas().TRUTH_SCHEMA,
         )
 
@@ -636,12 +676,10 @@ class PrepareAndTrainQRF(PostProcessingPlugin):
             msg = "Empty truth DataFrame after removing NaNs."
             raise ValueError(msg)
 
-        # Include time in the index, so that forecasts will be dropped if they
-        # correspond to a site and time that is not in the truth data.
-        forecast_index = forecast_df.set_index(
-            [*self.unique_site_id_keys] + ["time"]
-        ).index
-        truth_index = truth_df.set_index([*self.unique_site_id_keys] + ["time"]).index
+        # Match sites and validity times without copying unrelated feature columns.
+        match_columns = [*self.unique_site_id_keys, "time"]
+        forecast_index = pd.MultiIndex.from_frame(forecast_df[match_columns])
+        truth_index = pd.MultiIndex.from_frame(truth_df[match_columns])
         forecast_df = forecast_df[forecast_index.isin(truth_index)]
         truth_df = truth_df[truth_index.isin(forecast_index)]
 

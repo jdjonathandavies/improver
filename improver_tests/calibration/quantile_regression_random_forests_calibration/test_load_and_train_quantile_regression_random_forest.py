@@ -677,6 +677,87 @@ def test_load_for_qrf(
         np.testing.assert_almost_equal(cube_inputs[0].data, expected_cube.data)
 
 
+@pytest.mark.parametrize("representation", ["percentile", "realization"])
+@pytest.mark.parametrize("site_keys", [["wmo_id"], ["latitude", "longitude"]])
+def test_predictor_reads_only_merge_keys_and_values(
+    monkeypatch, tmp_path, representation, site_keys
+):
+    """Project predictor reads without changing shared features or merged values."""
+    import pyarrow.parquet as pq
+
+    forecast_path, source, _ = _create_multi_site_forecast_parquet_file(
+        tmp_path, representation
+    )
+    truth_path, _ = _create_multi_site_truth_parquet_file(tmp_path)
+    feature_config = {
+        "air_temperature": ["mean", "altitude", "latitude", "longitude"],
+        "wind_speed": ["mean"],
+        "wind_from_direction": ["static"],
+    }
+    diagnostics = [
+        "temperature_at_screen_level",
+        "wind_speed_at_10m",
+        "wind_direction_at_10m",
+    ]
+    cf_names = ["air_temperature", "wind_speed", "wind_from_direction"]
+    expected = amend_expected_forecast_df(
+        source.copy(),
+        "6",
+        diagnostics,
+        cf_names,
+        representation,
+        site_keys,
+        feature_config=feature_config,
+    )
+    reads = []
+    read_table = pq.read_table
+
+    def record_columns(*args, **kwargs):
+        reads.append(kwargs["columns"])
+        return read_table(*args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_table", record_columns)
+    forecast, _, _ = LoadForTrainQRF(
+        experiments=["latestblend", "recentblend", "recentblend"],
+        feature_config=feature_config,
+        parquet_diagnostic_names=diagnostics,
+        cf_names=cf_names,
+        forecast_periods="6",
+        cycletime="20170103T0000Z",
+        training_length=2,
+        unique_site_id_keys=site_keys,
+    )([forecast_path, truth_path])
+
+    pd.testing.assert_frame_equal(forecast, expected)
+    initial_columns = [
+        *site_keys,
+        "time",
+        *[
+            column
+            for column in ["forecast_reference_time", "forecast_period"]
+            if column not in site_keys
+        ],
+        "forecast",
+        representation,
+        *[
+            column
+            for column in ["altitude", "latitude", "longitude"]
+            if column not in site_keys
+        ],
+    ]
+    assert reads[0] == initial_columns
+    predictor_columns = {
+        *site_keys,
+        "forecast_reference_time",
+        "forecast_period",
+        representation,
+        "forecast",
+    }
+    assert len(reads) == 4
+    assert all(set(columns) == predictor_columns for columns in reads[1:3])
+    assert reads[3] == [*site_keys, "time", "ob_value"]
+
+
 def test_memray_training_stages(monkeypatch, tmp_path):
     """Stage captures are readable and do not change the trained predictions."""
     memray = pytest.importorskip("memray")

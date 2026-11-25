@@ -470,6 +470,8 @@ def amend_expected_forecast_df(
     feature_config=None,
 ):
     """Amend the expected forecast DataFrame to match the output of the plugin."""
+    import pyarrow as pa
+
     forecast_df = filter_forecast_periods(forecast_df, forecast_periods)
     for column in ["time", "forecast_reference_time", "blend_time"]:
         forecast_df[column] = pd.to_datetime(forecast_df[column], unit="ns", utc=True)
@@ -525,15 +527,25 @@ def amend_expected_forecast_df(
         for c in forecast_df.columns
         if c not in loaded and (c in cf_names[1:] or c in features)
     ]
-    return forecast_df[loaded + extra]
+    forecast_df = forecast_df[loaded + extra]
+    for column in site_id_keys:
+        if pd.api.types.is_string_dtype(forecast_df[column]):
+            forecast_df[column] = forecast_df[column].astype(pd.ArrowDtype(pa.string()))
+    return forecast_df
 
 
 def amend_expected_truth_df(truth_df, parquet_diagnostic_name, site_id="wmo_id"):
     """Amend the expected truth DataFrame to match the output of the plugin."""
+    import pyarrow as pa
+
     truth_df = truth_df[truth_df["diagnostic"] == parquet_diagnostic_name]
     truth_df["time"] = pd.to_datetime(truth_df["time"], unit="ns", utc=True)
     site_id_keys = [site_id] if isinstance(site_id, str) else list(site_id)
-    return truth_df[list(dict.fromkeys([*site_id_keys, "time", "ob_value"]))]
+    truth_df = truth_df[list(dict.fromkeys([*site_id_keys, "time", "ob_value"]))]
+    for column in site_id_keys:
+        if pd.api.types.is_string_dtype(truth_df[column]):
+            truth_df[column] = truth_df[column].astype(pd.ArrowDtype(pa.string()))
+    return truth_df
 
 
 @pytest.mark.parametrize("representation", ["percentile", "realization"])

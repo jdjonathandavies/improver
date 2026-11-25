@@ -1500,5 +1500,25 @@ def test_add_feature_from_df_to_df(
             np.array_equal(result_df[merge_column], data_df[merge_column])
 
 
+def test_add_feature_from_df_preserves_arrow_string_keys():
+    """Object-string ancillary keys must not expand compact forecast identifiers."""
+    import pyarrow as pa
+
+    forecast = pd.DataFrame(
+        {
+            "wmo_id": pd.Series(["01002", "01001"], dtype=pd.ArrowDtype(pa.string())),
+            "forecast": [272, 281],
+        }
+    )
+    ancillary = pd.DataFrame(
+        {"wmo_id": ["01001", "01002"], "distance_to_water": [10, 20]}
+    )
+    result = add_feature_from_df_to_df(
+        forecast, ancillary, "distance_to_water", ["wmo_id"]
+    )
+    pd.testing.assert_series_equal(result["wmo_id"], forecast["wmo_id"])
+    assert result["distance_to_water"].tolist() == [20, 10]
+
+
 if __name__ == "__main__":
     unittest.main()

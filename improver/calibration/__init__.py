@@ -678,6 +678,20 @@ def add_feature_from_df_to_df(
     """
     merge_columns = [col for col in possible_merge_columns if col in feature_df.columns]
 
+    # Keep compact Arrow-backed string keys through merges with cube-derived
+    # features, whose identifiers are commonly ordinary pandas object strings.
+    arrow_string_columns = [
+        col
+        for col in merge_columns
+        if isinstance(forecast_df[col].dtype, pd.ArrowDtype)
+        and (
+            pd.api.types.is_string_dtype(forecast_df[col].dtype)
+            and forecast_df[col].dtype.storage == "pyarrow"
+        )
+    ]
+    for column in arrow_string_columns:
+        feature_df[column] = feature_df[column].astype(forecast_df[column].dtype)
+
     # Select the required DataFrame subset using the merge_columns and dtypes.
     # Columns with any NaNs can not be converted to integers, and therefore are left
     # unmodified.

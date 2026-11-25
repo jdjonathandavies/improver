@@ -215,7 +215,13 @@ class LoadForTrainQRF(PostProcessingPlugin):
                 continue
             # Replace the column at its existing position with the normalised values.
             table = table.set_column(table.schema.get_field_index(name), name, column)
-        return table.to_pandas()
+        return table.to_pandas(
+            types_mapper=lambda dtype: (
+                pd.ArrowDtype(dtype)
+                if pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
+                else None
+            )
+        )
 
     def _diagnostic_merge_columns(
         self, representation: Optional[str] = None
